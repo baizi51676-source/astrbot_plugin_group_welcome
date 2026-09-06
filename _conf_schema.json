@@ -5,6 +5,12 @@
     "type": "text",
     "default": "🎉 欢迎 {name} 加入本群！很高兴认识你～{count_text}"
   },
+  "welcome_bots": {
+    "description": "🤖 启用欢迎的 bot（多 bot 场景）",
+    "hint": "v2.6.0：一个 AstrBot 挂多个 QQ 号时，填写平台实例 id 或登录 QQ 号 = 只在这些 bot 上触发欢迎；留空 = 全部 bot。",
+    "type": "list",
+    "default": []
+  },
   "group_whitelist": {
     "description": "✅ 白名单群号",
     "hint": "【白名单模式】填写后，只有这些群会触发欢迎。",
@@ -31,6 +37,18 @@
             "hint": "填写要套用该模板的群号。",
             "type": "list",
             "default": []
+          },
+          "bot_ids": {
+            "description": "适用 bot（v2.6.0）",
+            "hint": "填写登录 QQ 号；留空 = 所有 bot 适用。配合下方「专属模式」可实现同群只由指定 bot 欢迎。",
+            "type": "list",
+            "default": []
+          },
+          "exclusive": {
+            "description": "专属模式（v2.6.0）",
+            "hint": "仅当上方 bot_ids 非空时有效：开启后该群只由名单内 bot 负责欢迎，其他 bot 一律跳过（避免同群多 bot 重复欢迎）。",
+            "type": "bool",
+            "default": false
           },
           "template_text": {
             "description": "欢迎语",

@@ -62,7 +62,15 @@ class GroupWelcomePlugin(Star):
         self._is_running = True
 
         # 机器人自身 ID 缓存（用于跳过"机器人入群欢迎自己"）
-        self._self_id = None
+        # v2.6.0: 改为按 client 分开缓存（多 bot 各查各的）
+        self._self_id_cache = {}  # id(client) -> str(QQ号)
+        self._self_id_map = {}    # str(QQ号) -> client（事件 self_id 路由用）
+        self._qq_cache_ts = 0.0   # self_id 缓存时间戳（600s 过期）
+
+        # v2.6.0: 多 bot 欢迎白名单（留空=全部 aiocqhttp 实例）
+        self._welcome_bots = [str(x).strip()
+                              for x in (config.get("welcome_bots") or [])
+                              if str(x).strip()]
 
         # 【Fix #2】改为实例变量，避免热重载时状态残留
         self._global_cooldown = {}
@@ -97,33 +105,141 @@ class GroupWelcomePlugin(Star):
     # ──────────────────────────────────────────
 
     async def _safe_register_handler(self):
-        """稳健的事件监听注册逻辑。"""
+        """稳健的事件监听注册逻辑（v2.6.0 多 bot 版）。
+
+        遍历当前全部可用 aiocqhttp 客户端（多个 QQ 号 = 多个实例），
+        为每个 bot 分别注册 group_increase 监听；事件到达后按 self_id
+        （OneBot 事件自带的 bot QQ 号）路由到对应 client，避免串号。
+        """
         max_retries = 15
         for _ in range(max_retries):
             if not self._is_running:
                 return
 
-            client = self._get_client()
-            if client:
+            clients = self._all_clients()
+            if clients:
                 try:
-                    if hasattr(client, "on_notice"):
+                    for client in clients:
+                        if not hasattr(client, "on_notice"):
+                            continue
+                        # 闭包绑定当前 client
+                        bound_client = client
 
-                        @client.on_notice("group_increase")
+                        @bound_client.on_notice("group_increase")
                         async def _group_increase_handler(event):
                             if not self._is_running:
                                 return
-                            await self._on_notice(event)
+                            await self._on_notice(event, bound_client)
 
-                        logger.info(
-                            "[group_welcome] OneBot 11 入群事件监听已成功注册。"
-                        )
-                        return
+                    logger.info(
+                        "[group_welcome] OneBot 11 入群事件监听已注册："
+                        f"共 {len(clients)} 个 bot（{self._describe_bots(clients)}）。"
+                    )
+                    return
                 except Exception as e:
                     logger.error(f"[group_welcome] 注册监听失败: {e}")
 
             await asyncio.sleep(5)
 
         logger.warning("[group_welcome] 超时未找到 OneBot 适配器，插件功能可能受限。")
+
+    def _all_clients(self) -> list:
+        """返回当前所有可用 aiocqhttp 客户端（bot.api 形态，鸭子类型）。
+
+        兼容旧版 platform_manager.get_insts() 与新版 platform_insts 属性。
+        """
+        try:
+            mgr = getattr(self.context, "platform_manager", None)
+            insts = []
+            if mgr is not None:
+                insts = list(getattr(mgr, "platform_insts", None) or [])
+                if not insts and hasattr(mgr, "get_insts"):
+                    try:
+                        insts = list(mgr.get_insts())
+                    except Exception:
+                        insts = []
+        except Exception:
+            insts = []
+        out = []
+        for adapter in insts or []:
+            try:
+                if (hasattr(adapter, "bot") and adapter.bot
+                        and hasattr(adapter.bot, "api")):
+                    out.append(adapter.bot)
+            except Exception:
+                continue
+        return out
+
+    def _get_client(self):
+        """获取第一个可用客户端（多 bot 兼容的兜底/旧接口）。
+
+        事件链路请用 _client_for_event(event) 按 self_id 精确路由；
+        此方法仅在无法从事件判断 bot 时回退使用。
+        """
+        try:
+            clients = self._all_clients()
+            if clients:
+                return clients[0]
+        except Exception as e:
+            logger.debug(f"[group_welcome] _get_client 遍历适配器异常: {e}")
+        return None
+
+    def _describe_bots(self, clients: list) -> str:
+        """日志用：尽量显示 bot 的 QQ 号（从缓存读取，未探测到则显示序号）。"""
+        parts = []
+        for idx, client in enumerate(clients, 1):
+            qq = self._self_id_cache.get(id(client), "")
+            parts.append(qq or f"#{idx}")
+        return ", ".join(parts)
+
+    async def _bot_self_id(self, client) -> str:
+        """获取某 client 的登录 QQ 号（get_login_info），结果缓存 600s。"""
+        import time as _t
+        now = _t.time()
+        if now - self._qq_cache_ts > 600:
+            self._qq_cache_ts = now
+        cid = id(client)
+        if cid in self._self_id_cache:
+            return self._self_id_cache[cid]
+        qq = ""
+        try:
+            res = await client.api.call_action("get_login_info")
+            qq = str(res.get("user_id", ""))
+        except Exception as e:
+            logger.debug(f"[group_welcome] 获取登录信息失败: {e}")
+        self._self_id_cache[cid] = qq
+        if qq:
+            self._self_id_map[qq] = client
+        return qq
+
+    async def _client_for_event(self, event) -> object:
+        """按事件 self_id（bot 的 QQ 号）路由到对应 client。
+
+        事件带 self_id 且匹配成功 → 返回对应 client；
+        否则返回第一个可用 client（兼容无 self_id 的旧事件源）。
+        """
+        clients = self._all_clients()
+        if not clients:
+            return None
+        try:
+            sid = str(event.get("self_id") or "")
+        except Exception:
+            sid = ""
+        if sid:
+            # 优先查路由缓存；未命中则逐个探测并回填
+            if sid in self._self_id_map:
+                return self._self_id_map[sid]
+            for client in clients:
+                qq = await self._bot_self_id(client)
+                if qq == sid:
+                    return client
+        return clients[0]
+
+    def _bot_enabled(self, qq: str) -> bool:
+        """welcome_bots 白名单过滤：留空=全部 bot 生效。"""
+        if not self._welcome_bots:
+            return True
+        return bool(qq) and qq in self._welcome_bots
 
     async def terminate(self):
         """插件卸载回调。"""
@@ -171,31 +287,11 @@ class GroupWelcomePlugin(Star):
     # 核心逻辑
     # ──────────────────────────────────────────
 
-    def _get_client(self):
-        """
-        使用鸭子类型判断适配器是否可用，
-        避免依赖类名字符串匹配导致的脆弱性。
-        只要适配器拥有 bot 对象且 bot 具备 api 属性，即视为有效客户端。
-        """
-        try:
-            for adapter in self.context.platform_manager.get_insts():
-                if (
-                    hasattr(adapter, "bot")
-                    and adapter.bot
-                    and hasattr(adapter.bot, "api")
-                ):
-                    return adapter.bot
-        except Exception as e:
-            logger.debug(f"[group_welcome] _get_client 遍历适配器异常: {e}")
-        return None
-
     async def _is_self_user(self, client, user_id: str) -> bool:
-        """判断 user_id 是否为机器人自身（OneBot get_login_info）。结果缓存。"""
+        """判断 user_id 是否为该 client 自身（OneBot get_login_info）。结果按 client 缓存。"""
         try:
-            if self._self_id is None:
-                res = await client.api.call_action("get_login_info")
-                self._self_id = str(res.get("user_id", ""))
-            return user_id == self._self_id
+            qq = await self._bot_self_id(client)
+            return bool(qq) and user_id == qq
         except Exception as e:
             logger.debug(f"[group_welcome] 获取机器人自身信息失败: {e}")
             return False
@@ -212,7 +308,12 @@ class GroupWelcomePlugin(Star):
         self._last_cleanup_time = now
         self._save_cooldowns()
 
-    async def _on_notice(self, event):
+    async def _on_notice(self, event, client=None):
+        """群成员增加事件处理（v2.6.0 多 bot）。
+
+        client：触发该事件的 bot 客户端（监听闭包绑定传入）；
+        为空时按事件 self_id 自动路由到对应 bot。
+        """
         try:
             notice_type = event.get("notice_type")
             group_id = str(event.get("group_id", ""))
@@ -226,20 +327,34 @@ class GroupWelcomePlugin(Star):
         if not self._check_group_allowed(group_id):
             return
 
+        # v2.6.0: 多 bot 路由 + welcome_bots 白名单
+        if client is None:
+            client = await self._client_for_event(event)
+        if client is None:
+            return
+        qq = await self._bot_self_id(client)
+        if not self._bot_enabled(qq):
+            logger.debug(f"[group_welcome] bot[{qq or '?'}] 不在 welcome_bots"
+                         f" 中，群 {group_id} 欢迎跳过")
+            return
+        # v2.6.0: 群已被其他 bot 的专属模板认领（exclusive）→ 本 bot 跳过
+        if self._group_claimed_by_other(group_id, qq):
+            logger.info(f"[group_welcome] 群 {group_id} 由其他 bot 的专属模板"
+                        f"负责，bot[{qq or '?'}] 跳过")
+            return
+
         self._clean_expired_cooldowns()
 
         key = f"{group_id}:{user_id}"
-        cooldown = self._get_resolved_config(group_id, "cooldown_seconds", self.config.get("cooldown_seconds", 300))
+        cooldown = self._get_resolved_config(
+            group_id, "cooldown_seconds",
+            self.config.get("cooldown_seconds", 300), qq)
 
         async with self._lock:
             now = time.time()
             if now - self._global_cooldown.get(key, 0) < cooldown:
                 return
             self._global_cooldown[key] = now
-
-        client = self._get_client()
-        if not client:
-            return
 
         # 【Fix #3】机器人自己入群时不欢迎自己
         if await self._is_self_user(client, user_id):
@@ -249,13 +364,14 @@ class GroupWelcomePlugin(Star):
         name = await self._get_member_name(client, group_id, user_id)
 
         count_text = ""
-        if self._get_resolved_config(group_id, "enable_member_count", self._enable_member_count):
+        if self._get_resolved_config(group_id, "enable_member_count",
+                                     self._enable_member_count, qq):
             count = await self._get_group_member_count(client, group_id)
             if count:
                 count_text = f"\n你是当前群里第 {count} 位成员！"
 
         # 生成欢迎语
-        template = self._get_welcome_template(group_id)
+        template = self._get_welcome_template(group_id, qq)
 
         try:
             welcome_text = template.format(name=name, count_text=count_text)
@@ -263,15 +379,19 @@ class GroupWelcomePlugin(Star):
             logger.warning(f"[group_welcome] 群 {group_id} 欢迎语模板格式错误: {e}")
             welcome_text = f"🎉 欢迎 {name} 加入本群！{count_text}"
 
-        if self._get_resolved_config(group_id, "enable_ai_welcome", self._enable_ai_welcome):
-            ai_text = await self._gen_ai_welcome(group_id, name)
+        if self._get_resolved_config(group_id, "enable_ai_welcome",
+                                     self._enable_ai_welcome, qq):
+            ai_text = await self._gen_ai_welcome(group_id, name, qq)
             if ai_text:
                 welcome_text += f"\n\n✨ {ai_text}"
 
         await self._send_group_welcome(client, group_id, user_id, welcome_text)
 
-        if self._get_resolved_config(group_id, "enable_private_rules", self._enable_private_rules):
-            rules = self._get_resolved_config(group_id, "group_rules", self.config.get("group_rules", "📋 请遵守群规，友善交流！"))
+        if self._get_resolved_config(group_id, "enable_private_rules",
+                                     self._enable_private_rules, qq):
+            rules = self._get_resolved_config(
+                group_id, "group_rules",
+                self.config.get("group_rules", "📋 请遵守群规，友善交流！"), qq)
             await self._send_private_rules(client, user_id, rules)
 
     def _check_group_allowed(self, group_id: str) -> bool:
@@ -279,9 +399,9 @@ class GroupWelcomePlugin(Star):
             return group_id in self._whitelist
         return group_id not in self._blacklist
 
-    def _get_welcome_template(self, group_id: str) -> str:
-        # 优先级1：模板库中匹配当前群的模板欢迎语
-        tpl = self._get_template_for_group(group_id)
+    def _get_welcome_template(self, group_id: str, self_id: str = "") -> str:
+        # 优先级1：模板库中匹配当前群 + 当前 bot 的模板欢迎语
+        tpl = self._get_template_for_group(group_id, self_id)
         if tpl:
             tpl_text = tpl.get("template_text")
             if isinstance(tpl_text, str) and tpl_text.strip():
@@ -296,21 +416,73 @@ class GroupWelcomePlugin(Star):
         """加载模板库配置。"""
         return _parse_template_list(self.config.get("group_template_list", []))
 
-    def _get_template_for_group(self, group_id: str) -> dict | None:
-        """查找 group_ids 包含当前群号的模板，返回第一个匹配项。"""
+    def _template_matches_bot(self, tpl: dict, self_id: str) -> bool:
+        """v2.6.0: 模板的 bot_ids 匹配。留空 = 所有 bot 适用；
+        非空 = 仅名单内 bot（按 QQ 号）适用。"""
+        bot_ids = tpl.get("bot_ids") or []
+        if not bot_ids:
+            return True
+        if not self_id:
+            return False  # 未知来源不匹配专属模板
+        return self_id in {str(b) for b in bot_ids}
+
+    def _group_claimed_by_other(self, group_id: str, self_id: str) -> bool:
+        """v2.6.0: 群是否存在"绑定其他 bot 且 exclusive"的专属模板。
+
+        存在 → 说明该群由其他 bot 专门负责，当前 bot（self_id）
+        不应再欢迎此群（避免同群多 bot 重复欢迎）。
+        """
+        try:
+            for tpl in self._load_template_list():
+                ids = tpl.get("group_ids") or []
+                if group_id not in {str(i) for i in ids}:
+                    continue
+                bot_ids = tpl.get("bot_ids") or []
+                if not bot_ids:
+                    continue
+                if not bool(tpl.get("exclusive")):
+                    continue
+                if self_id and self_id in {str(b) for b in bot_ids}:
+                    continue  # 自己就是负责人
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_template_for_group(self, group_id: str,
+                                self_id: str = "") -> dict | None:
+        """查找 group_ids 包含当前群号且 bot 匹配的模板。
+
+        v2.6.0 返回优先级：bot 专属（bot_ids 含 self_id）→ 通用
+        （bot_ids 留空）。若群已被其他 bot 的 exclusive 专属模板认领，
+        通用模板同样不可用（返回 None）。
+        """
+        matched_any = None
         for tpl in self._load_template_list():
             ids = tpl.get("group_ids") or []
-            if group_id in {str(i) for i in ids}:
-                return tpl
-        return None
+            if group_id not in {str(i) for i in ids}:
+                continue
+            if not self._template_matches_bot(tpl, self_id):
+                continue
+            if tpl.get("bot_ids"):
+                return tpl  # bot 专属命中优先返回
+            if matched_any is None:
+                matched_any = tpl
+        if matched_any is None:
+            return None
+        if self._group_claimed_by_other(group_id, self_id):
+            return None  # 群已被其他 bot 专属认领 → 通用模板不生效
+        return matched_any
 
-    def _get_resolved_config(self, group_id: str, key: str, global_value):
+    def _get_resolved_config(self, group_id: str, key: str,
+                             global_value, self_id: str = ""):
         """三级 fallback：模板字段(非空) → 全局配置 → 全局默认。
 
-        模板里的 bool/int 字段始终以模板为准（模板条目的 default 已由 WebUI 填充），
-        字符串/list 字段为空时回退到全局配置。
+        v2.6.0 增加 self_id（bot QQ 号）维度：模板按 群+bot 匹配；
+        模板里的 bool/int 字段始终以模板为准（模板条目的 default 已由
+        WebUI 填充），字符串/list 字段为空时回退到全局配置。
         """
-        tpl = self._get_template_for_group(group_id)
+        tpl = self._get_template_for_group(group_id, self_id)
         if tpl is None:
             return global_value
         value = tpl.get(key)
@@ -407,13 +579,16 @@ class GroupWelcomePlugin(Star):
         except Exception as e:
             logger.warning(f"[group_welcome] 私聊发送群规失败: {e}")
 
-    async def _gen_ai_welcome(self, group_id: str, name: str) -> str:
+    async def _gen_ai_welcome(self, group_id: str, name: str,
+                              self_id: str = "") -> str:
         """
         使用指定的 LLM Provider 生成欢迎语，支持配置重试次数。
-        模板配置优先，空值回退全局配置。
+        模板配置优先（群+bot 维度），空值回退全局配置。
         """
         try:
-            provider_id = self._get_resolved_config(group_id, "llm_provider", self.config.get("llm_provider", ""))
+            provider_id = self._get_resolved_config(
+                group_id, "llm_provider",
+                self.config.get("llm_provider", ""), self_id)
             provider = None
 
             if provider_id:
@@ -436,6 +611,7 @@ class GroupWelcomePlugin(Star):
                     "ai_welcome_prompt",
                     "请根据以下昵称，生成一句简短、温暖、有趣的入群欢迎语：{name}",
                 ),
+                self_id,
             )
 
             final_prompt = prompt_fmt.replace("{name}", name)
@@ -444,7 +620,8 @@ class GroupWelcomePlugin(Star):
                     f"请根据以下昵称，生成一句简短、温暖、有趣的入群欢迎语：{name}"
                 )
 
-            retry_count = self._get_resolved_config(group_id, "ai_retry_count", self._ai_retry_count)
+            retry_count = self._get_resolved_config(
+                group_id, "ai_retry_count", self._ai_retry_count, self_id)
             last_error = None
             for attempt in range(retry_count + 1):
                 try:
@@ -634,7 +811,8 @@ class GroupWelcomePlugin(Star):
             self._del_group_template(target_group_id)
             yield event.plain_result(f"✅ 群 {target_group_id} 已恢复默认。")
         elif op_type == "show":
-            tmpl = self._get_welcome_template(target_group_id)
+            sid = str(getattr(event.message_obj, "self_id", "") or "")
+            tmpl = self._get_welcome_template(target_group_id, sid)
             yield event.plain_result(f"📋 群 {target_group_id} 当前欢迎语：\n{tmpl}")
         elif op_type == "set":
             if not final_content:
@@ -706,14 +884,15 @@ class GroupWelcomePlugin(Star):
         bl = "、".join(sorted(self._blacklist)) if self._blacklist else "（空）"
 
         if query_gid:
-            matched_tpl = self._get_template_for_group(query_gid)
+            sid = str(getattr(event.message_obj, "self_id", "") or "")
+            matched_tpl = self._get_template_for_group(query_gid, sid)
             if matched_tpl:
                 source = f"模板库（第 {template_list.index(matched_tpl) + 1} 条）"
             elif query_gid in templates:
                 source = "群专属"
             else:
                 source = "全局默认"
-            tip = f"📌 群 {query_gid} 欢迎语 [{source}]：\n{self._get_welcome_template(query_gid)}"
+            tip = f"📌 群 {query_gid} 欢迎语 [{source}]：\n{self._get_welcome_template(query_gid, sid)}"
         else:
             tip = (
                 f"📌 已自定义群数：{len(templates)}\n"
