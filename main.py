@@ -144,7 +144,7 @@ class GroupWelcomePlugin(Star):
         logger.warning("[group_welcome] 超时未找到 OneBot 适配器，插件功能可能受限。")
 
     def _all_clients(self) -> list:
-        """返回当前所有可用 aiocqhttp 客户端（bot.api 形态，鸭子类型）。
+        """返回当前所有可用 aiocqhttp 客户端（call_action 形态，鸭子类型）。
 
         兼容旧版 platform_manager.get_insts() 与新版 platform_insts 属性。
         """
@@ -164,7 +164,7 @@ class GroupWelcomePlugin(Star):
         for adapter in insts or []:
             try:
                 if (hasattr(adapter, "bot") and adapter.bot
-                        and hasattr(adapter.bot, "api")):
+                        and hasattr(adapter.bot, "call_action")):
                     out.append(adapter.bot)
             except Exception:
                 continue
@@ -203,7 +203,7 @@ class GroupWelcomePlugin(Star):
             return self._self_id_cache[cid]
         qq = ""
         try:
-            res = await client.api.call_action("get_login_info")
+            res = await client.call_action("get_login_info")
             qq = str(res.get("user_id", ""))
         except Exception as e:
             logger.debug(f"[group_welcome] 获取登录信息失败: {e}")
@@ -496,7 +496,7 @@ class GroupWelcomePlugin(Star):
         try:
             if not group_id.isdigit() or not user_id.isdigit():
                 return user_id
-            res = await client.api.call_action(
+            res = await client.call_action(
                 "get_group_member_info",
                 group_id=int(group_id),
                 user_id=int(user_id),
@@ -511,7 +511,7 @@ class GroupWelcomePlugin(Star):
         try:
             if not group_id.isdigit():
                 return None
-            res = await client.api.call_action(
+            res = await client.call_action(
                 "get_group_info", group_id=int(group_id), no_cache=True
             )
             return res.get("member_count")
@@ -531,7 +531,7 @@ class GroupWelcomePlugin(Star):
                 image_url = random.choice(image_urls)
                 message.append({"type": "image", "data": {"file": image_url}})
                 logger.debug(f"[group_welcome] 已随机附加欢迎图片: {image_url}")
-            await client.api.call_action(
+            await client.call_action(
                 "send_group_msg", group_id=int(group_id), message=message
             )
         except Exception as e:
@@ -573,7 +573,7 @@ class GroupWelcomePlugin(Star):
         try:
             if not user_id.isdigit():
                 return
-            await client.api.call_action(
+            await client.call_action(
                 "send_private_msg", user_id=int(user_id), message=rules
             )
         except Exception as e:

@@ -1,4 +1,7 @@
 # 更新日志 (CHANGELOG)
+## [v2.6.1]
+*   **Fix**    : 修复多 bot 模式下无法识别 bot 自身 QQ 号的问题（v2.6.0 中误用 client.api.call_action，在 AstrBot 4.27 + aiocqhttp 适配器上调用失败导致 welcome_bots 白名单误判，欢迎语被跳过）；统一改用 client.call_action，与同机 napcat_history_exporter 验证通过的调用方式一致
+*   **Changed**: metadata.yaml repo 字段更正为 fork 仓库地址（baizi51676-source/astrbot_plugin_group_welcome）
 
 ## [v2.6.0]
 *   **Added**  : 多 bot 支持——一个 AstrBot 挂多个 QQ 号（多个 aiocqhttp 实例）时，为每个 bot 分别注册入群监听，事件按 self_id 路由到对应 bot，各 bot 互不串号、独立欢迎自己群里的新人
